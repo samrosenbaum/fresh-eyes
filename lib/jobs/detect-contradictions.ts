@@ -1,7 +1,6 @@
 import { inngest } from '@/lib/inngest';
 import { supabaseAdmin } from '@/lib/supabase';
-import { anthropic, ANALYSIS_MODEL } from '@/lib/anthropic';
-import { buildContradictionPrompt } from '@/lib/prompts/contradiction-detection';
+import { CaseGapFinding, detectCaseGaps } from '@/lib/ai/tasks/detect-case-gaps';
 
 export const detectContradictionsJob = inngest.createFunction(
   {
@@ -9,8 +8,8 @@ export const detectContradictionsJob = inngest.createFunction(
     name: 'Detect Case Contradictions',
     retries: 1,
     concurrency: { limit: 2 },
+    triggers: { event: 'analysis/detect-contradictions' },
   },
-  { event: 'analysis/detect-contradictions' },
   async ({ event, step }) => {
     const { caseId } = event.data;
 
@@ -55,23 +54,9 @@ export const detectContradictionsJob = inngest.createFunction(
       };
     });
 
-    // Run contradiction detection
-    const contradictions = await step.run('detect', async () => {
-      const prompt = buildContradictionPrompt(caseData);
-      const response = await anthropic.messages.create({
-        model: ANALYSIS_MODEL,
-        max_tokens: 8192,
-        messages: [{ role: 'user', content: prompt }],
-      });
-
-      const content = response.content[0].type === 'text' ? response.content[0].text : '[]';
-      try {
-        const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-        return JSON.parse(cleaned);
-      } catch {
-        console.error('[detect-contradictions] Failed to parse JSON:', content.slice(0, 500));
-        return [];
-      }
+    // Run case-gap detection through the AI task layer.
+    const contradictions = await step.run('detect', async (): Promise<CaseGapFinding[]> => {
+      return detectCaseGaps(caseData);
     });
 
     // Store contradictions

@@ -1,4 +1,4 @@
-import { Inngest, EventSchemas } from 'inngest';
+import { Inngest } from 'inngest';
 
 type Events = {
   'document/uploaded': {
@@ -21,7 +21,6 @@ type Events = {
 export const inngest = new Inngest({
   id: 'fresheyes',
   name: 'FreshEyes Cold Case Intelligence',
-  schemas: new EventSchemas().fromRecord<Events>(),
   eventKey: process.env.INNGEST_EVENT_KEY,
 });
 
@@ -33,5 +32,5 @@ export async function sendEvent<K extends keyof Events>(
     console.warn(`[Inngest] Not configured — event not sent: ${name}`);
     return;
   }
-  await inngest.send({ name, data } as any);
+  await inngest.send({ name, data });
 }

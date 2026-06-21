@@ -1,60 +1,31 @@
 import { inngest } from '@/lib/inngest';
 import { supabaseAdmin } from '@/lib/supabase';
-import { anthropic, ANALYSIS_MODEL } from '@/lib/anthropic';
-import { OCR_PROMPT } from '@/lib/prompts/ocr';
-import { buildEntityExtractionPrompt } from '@/lib/prompts/entity-extraction';
+import { transcribeImage, transcribePdfDocument } from '@/lib/ai/tasks/ocr';
+import { extractCaseGraphFromDocument, ExtractedCaseGraph } from '@/lib/ai/tasks/extract-case-graph';
 
 // ── OCR ────────────────────────────────────────────────────────────────────
 
-async function ocrWithClaude(imageBuffer: Buffer, mediaType: 'image/jpeg' | 'image/png' | 'image/webp'): Promise<string> {
-  const response = await anthropic.messages.create({
-    model: ANALYSIS_MODEL,
-    max_tokens: 4096,
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBuffer.toString('base64') } },
-        { type: 'text', text: OCR_PROMPT },
-      ],
-    }],
-  });
-  return response.content[0].type === 'text' ? response.content[0].text : '';
-}
+// OCR helpers live behind lib/ai so jobs are not coupled to a provider SDK.
 
 async function extractPdfText(buffer: Buffer): Promise<{ text: string; method: string; pageCount: number }> {
   // Try native text extraction first (fast, for digital PDFs)
   try {
-    const pdfParse = (await import('pdf-parse')).default;
-    const data = await pdfParse(buffer);
+    const { PDFParse } = await import('pdf-parse');
+    const parser = new PDFParse({ data: new Uint8Array(buffer) });
+    const data = await parser.getText();
+    await parser.destroy();
     const text = data.text?.trim() || '';
     if (text.length > 100) {
-      return { text, method: 'pdf-text', pageCount: data.numpages };
+      return { text, method: 'pdf-text', pageCount: data.total };
     }
   } catch {
-    // fall through to Claude vision
+    // fall through to vision OCR
   }
 
-  // Scanned PDF — use Claude vision on each page image
-  // We'll send the whole PDF as an image if it's small enough, otherwise page by page
-  // For simplicity, convert to base64 and send first page via Claude
-  // Production would use pdf2pic to rasterize each page
-  const base64 = buffer.toString('base64');
-  const response = await anthropic.messages.create({
-    model: ANALYSIS_MODEL,
-    max_tokens: 8192,
-    messages: [{
-      role: 'user',
-      content: [
-        {
-          type: 'document',
-          source: { type: 'base64', media_type: 'application/pdf', data: base64 },
-        } as any,
-        { type: 'text', text: OCR_PROMPT },
-      ],
-    }],
-  });
-  const text = response.content[0].type === 'text' ? response.content[0].text : '';
-  return { text, method: 'claude-vision', pageCount: 1 };
+  // Scanned PDF — use the AI OCR task. Production should rasterize and store
+  // page-level OCR, but the provider-specific call is intentionally isolated.
+  const text = await transcribePdfDocument({ pdfBuffer: buffer });
+  return { text, method: 'ai-vision', pageCount: 1 };
 }
 
 async function performOcr(buffer: Buffer, fileType: string, storagePath: string): Promise<{ text: string; method: string; pageCount: number }> {
@@ -64,69 +35,22 @@ async function performOcr(buffer: Buffer, fileType: string, storagePath: string)
     return extractPdfText(buffer);
   }
 
-  // Image files
   const mediaTypeMap: Record<string, 'image/jpeg' | 'image/png' | 'image/webp'> = {
     jpg: 'image/jpeg', jpeg: 'image/jpeg',
     png: 'image/png',
     webp: 'image/webp',
   };
   const mediaType = mediaTypeMap[ext] || 'image/jpeg';
-  const text = await ocrWithClaude(buffer, mediaType);
-  return { text, method: 'claude-vision', pageCount: 1 };
+  const text = await transcribeImage({ imageBuffer: buffer, mediaType });
+  return { text, method: 'ai-vision', pageCount: 1 };
 }
 
 // ── Entity Extraction ───────────────────────────────────────────────────────
 
-interface ExtractedData {
-  entities: Array<{
-    type: string;
-    name: string;
-    aliases: string[];
-    role: string;
-    attributes: Record<string, any>;
-  }>;
-  relationships: Array<{
-    from: string;
-    to: string;
-    type: string;
-    description: string;
-  }>;
-  statements: Array<{
-    speaker: string | null;
-    date: string | null;
-    time: string | null;
-    content: string;
-    about: string[];
-  }>;
-  timeline_events: Array<{
-    date: string | null;
-    time: string | null;
-    precision: string;
-    description: string;
-    people: string[];
-  }>;
-}
+type ExtractedData = ExtractedCaseGraph;
 
 async function extractEntities(text: string, documentType: string, filename: string): Promise<ExtractedData> {
-  const prompt = buildEntityExtractionPrompt(documentType, filename);
-  const response = await anthropic.messages.create({
-    model: ANALYSIS_MODEL,
-    max_tokens: 8192,
-    messages: [
-      { role: 'user', content: prompt },
-      { role: 'assistant', content: `Here is the document text to analyze:\n\n${text}\n\nExtracted JSON:` },
-    ],
-  });
-
-  const content = response.content[0].type === 'text' ? response.content[0].text : '{}';
-  try {
-    // Strip any markdown code fences
-    const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    return JSON.parse(cleaned);
-  } catch {
-    console.error('[process-document] Failed to parse entity extraction JSON:', content.slice(0, 500));
-    return { entities: [], relationships: [], statements: [], timeline_events: [] };
-  }
+  return extractCaseGraphFromDocument({ text, documentType, filename });
 }
 
 // ── Entity Deduplication ────────────────────────────────────────────────────
@@ -143,7 +67,6 @@ async function resolveOrCreateEntity(
     .eq('type', extracted.type);
 
   if (existing) {
-    const nameLower = extracted.name.toLowerCase();
     const match = existing.find(e => {
       const existingNames = [e.canonical_name, ...(e.aliases || [])].map((n: string) => n.toLowerCase());
       const extractedNames = [extracted.name, ...(extracted.aliases || [])].map(n => n.toLowerCase());
@@ -196,8 +119,8 @@ export const processDocumentJob = inngest.createFunction(
     name: 'Process Case Document',
     retries: 2,
     concurrency: { limit: 3 },
+    triggers: { event: 'document/uploaded' },
   },
-  { event: 'document/uploaded' },
   async ({ event, step }) => {
     const { caseId, fileId, storagePath, fileType, documentType } = event.data;
 
@@ -255,7 +178,7 @@ export const processDocumentJob = inngest.createFunction(
       };
 
       // Entity mentions (each entity gets a mention on this file)
-      for (const [entityName, entityId] of Object.entries(entityIdMap)) {
+      for (const entityId of Object.values(entityIdMap)) {
         await supabaseAdmin.from('entity_mentions').insert({
           entity_id: entityId,
           file_id: fileId,

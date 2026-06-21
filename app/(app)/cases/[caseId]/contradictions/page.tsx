@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { apiFetch } from '@/lib/auth';
-import { ArrowLeft, AlertTriangle, RefreshCw, Loader2, CheckCircle, XCircle } from 'lucide-react';
+import { ArrowLeft, AlertTriangle, RefreshCw, Loader2, CheckCircle } from 'lucide-react';
 
 const SEVERITY_CONFIG = {
   critical: { color: 'border-red-500/50 bg-red-500/5', badge: 'bg-red-500/20 text-red-400 border-red-500/30', label: 'CRITICAL' },

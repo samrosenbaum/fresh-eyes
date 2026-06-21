@@ -1,24 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase';
 import { createClient } from '@supabase/supabase-js';
-import { cookies } from 'next/headers';
-
-async function getSessionUser() {
-  const cookieStore = cookies();
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    { auth: { persistSession: false } }
-  );
-  // Pass cookies for server-side auth
-  const authCookie = cookieStore.get('sb-access-token')?.value ||
-    [...(cookieStore.getAll())].find(c => c.name.includes('auth-token'))?.value;
-  if (authCookie) {
-    const { data: { user } } = await supabase.auth.getUser(authCookie);
-    return user;
-  }
-  return null;
-}
 
 export async function GET(req: NextRequest) {
   const authHeader = req.headers.get('authorization');
