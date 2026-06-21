@@ -9,7 +9,7 @@ export const maxDuration = 300;
 const handler = serve({
   client: inngest,
   functions: [processDocumentJob, detectContradictionsJob, generateReportJob],
-  streaming: 'allow',
+  streaming: true,
 });
 
 export { handler as GET, handler as POST, handler as PUT };

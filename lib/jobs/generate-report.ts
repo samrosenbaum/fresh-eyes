@@ -1,7 +1,7 @@
 import { inngest } from '@/lib/inngest';
 import { supabaseAdmin } from '@/lib/supabase';
-import { anthropic, ANALYSIS_MODEL } from '@/lib/anthropic';
-import { buildReportPrompt } from '@/lib/prompts/report';
+import { AI_MODELS } from '@/lib/ai/models';
+import { generateCaseBrief } from '@/lib/ai/tasks/generate-case-brief';
 
 export const generateReportJob = inngest.createFunction(
   {
@@ -9,8 +9,8 @@ export const generateReportJob = inngest.createFunction(
     name: 'Generate Investigation Report',
     retries: 1,
     concurrency: { limit: 2 },
+    triggers: { event: 'analysis/generate-report' },
   },
-  { event: 'analysis/generate-report' },
   async ({ event, step }) => {
     const { caseId } = event.data;
 
@@ -44,13 +44,7 @@ export const generateReportJob = inngest.createFunction(
     });
 
     const report = await step.run('generate', async () => {
-      const prompt = buildReportPrompt(caseData);
-      const response = await anthropic.messages.create({
-        model: ANALYSIS_MODEL,
-        max_tokens: 16384,
-        messages: [{ role: 'user', content: prompt }],
-      });
-      return response.content[0].type === 'text' ? response.content[0].text : '';
+      return generateCaseBrief(caseData);
     });
 
     await step.run('store-report', async () => {
@@ -58,7 +52,7 @@ export const generateReportJob = inngest.createFunction(
         case_id: caseId,
         report_type: 'full_analysis',
         content: report,
-        model_used: ANALYSIS_MODEL,
+        model_used: AI_MODELS.briefing,
         files_analyzed: caseData.fileCount,
         entities_found: caseData.entities.length,
         contradictions_found: caseData.contradictions.length,

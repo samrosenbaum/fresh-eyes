@@ -1,13 +1,15 @@
-// This file intentionally left as a redirect — actual / page is app/page.tsx
 'use client';
-import { redirect } from 'next/navigation';
-export default function AppIndexPage() { redirect('/'); }
+
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { AlertTriangle, ChevronRight, FileText, Plus, Users } from 'lucide-react';
+import { apiFetch } from '@/lib/auth';
 
 interface Case {
   id: string;
   name: string;
-  description: string;
-  incident_date: string;
+  description: string | null;
+  incident_date: string | null;
   status: string;
   created_at: string;
   case_files: [{ count: number }];
@@ -18,12 +20,16 @@ interface Case {
 export default function CasesPage() {
   const [cases, setCases] = useState<Case[]>([]);
   const [loading, setLoading] = useState(true);
-  const router = useRouter();
+  const [error, setError] = useState('');
 
   useEffect(() => {
     apiFetch('/api/cases')
-      .then(r => r.json())
-      .then(d => setCases(d.cases || []))
+      .then(async r => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Failed to load cases');
+        setCases(data.cases || []);
+      })
+      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load cases'))
       .finally(() => setLoading(false));
   }, []);
 
@@ -45,7 +51,11 @@ export default function CasesPage() {
         </Link>
       </div>
 
-      {cases.length === 0 ? (
+      {error ? (
+        <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-5 text-red-300 text-sm">
+          {error}
+        </div>
+      ) : cases.length === 0 ? (
         <div className="text-center py-20 text-gray-500">
           <AlertTriangle className="w-10 h-10 mx-auto mb-3 opacity-30" />
           <p>No cases yet. Create your first case to get started.</p>
