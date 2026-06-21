@@ -1,0 +1,1 @@
+export const OCR_PROMPT = `Transcribe all text in this document exactly as written. This is a law enforcement document — accuracy is critical. Preserve all names, dates, times, and numbers exactly as they appear. Mark any illegible text as [illegible]. Do not add commentary or interpretation. Output only the transcription.`;
