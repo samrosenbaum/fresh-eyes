@@ -5,9 +5,21 @@ type Events = {
     data: {
       caseId: string;
       fileId: string;
+      importBatchId?: string;
       storagePath: string;
       fileType: string;
       documentType: string;
+    };
+  };
+  'intake/ocr-page-chunk': {
+    data: {
+      caseId: string;
+      fileId: string;
+      importBatchId?: string | null;
+      storagePath: string;
+      kind: 'pdf-scan' | 'image';
+      startPage: number;
+      endPage: number;
     };
   };
   'analysis/detect-contradictions': {

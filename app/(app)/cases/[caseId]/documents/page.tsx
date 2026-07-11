@@ -34,9 +34,28 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+interface BatchStats {
+  fileCount: number;
+  completedFileCount: number;
+  failedFileCount: number;
+  pageCount: number;
+  lowConfidencePageCount: number;
+  duplicatePageCount: number;
+}
+
+interface ImportBatch {
+  id: string;
+  label: string | null;
+  status: string;
+  error: string | null;
+  created_at: string;
+  stats: BatchStats;
+}
+
 export default function DocumentsPage() {
   const { caseId } = useParams<{ caseId: string }>();
   const [files, setFiles] = useState<any[]>([]);
+  const [batches, setBatches] = useState<ImportBatch[]>([]);
   const [intake, setIntake] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
@@ -46,11 +65,16 @@ export default function DocumentsPage() {
   const pollRef = useRef<NodeJS.Timeout | null>(null);
 
   const loadFiles = useCallback(async () => {
-    const res = await apiFetch(`/api/cases/${caseId}/files`);
-    const data = await res.json();
-    setFiles(data.files || []);
-    setIntake(data.intake || null);
-    return data.files || [];
+    const [filesRes, batchesRes] = await Promise.all([
+      apiFetch(`/api/cases/${caseId}/files`),
+      apiFetch(`/api/cases/${caseId}/import-batches`),
+    ]);
+    const filesData = await filesRes.json();
+    const batchesData = await batchesRes.json();
+    setFiles(filesData.files || []);
+    setIntake(filesData.intake || null);
+    setBatches(batchesData.batches || []);
+    return filesData.files || [];
   }, [caseId]);
 
   useEffect(() => {
@@ -69,42 +93,63 @@ export default function DocumentsPage() {
     return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
   }, [files, loadFiles]);
 
-  async function uploadFile(file: File, importBatchId?: string) {
+  async function createBatch(fileCount: number): Promise<string | undefined> {
+    const res = await apiFetch(`/api/cases/${caseId}/import-batches`, {
+      method: 'POST',
+      body: JSON.stringify({
+        label: `Upload of ${fileCount} file${fileCount === 1 ? '' : 's'} — ${new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })}`,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) { alert('Failed to start import batch: ' + (data.error || 'Unknown error')); return undefined; }
+    return data.batch.id;
+  }
+
+  async function uploadFile(file: File, importBatchId: string) {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return false;
+
+    const ext = file.name.split('.').pop();
+    const storagePath = `${session.user.id}/${caseId}/${Date.now()}-${file.name}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('case-files')
+      .upload(storagePath, file, { upsert: false });
+
+    if (uploadError) { alert(`Upload failed for ${file.name}: ` + uploadError.message); return false; }
+
+    const fileType = file.type.startsWith('image/') ? 'image' : ext === 'pdf' ? 'pdf' : 'other';
+    const res = await apiFetch(`/api/cases/${caseId}/files`, {
+      method: 'POST',
+      body: JSON.stringify({ filename: file.name, storagePath, fileType, fileSize: file.size, documentType: docType, importBatchId }),
+    });
+    const data = await res.json();
+    if (!res.ok) { alert(`Intake failed for ${file.name}: ` + (data.error || 'Unable to register file')); return false; }
+    return true;
+  }
+
+  async function handleFiles(fileList: FileList | null) {
+    if (!fileList || fileList.length === 0) return;
     setUploading(true);
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) return;
-
-      const ext = file.name.split('.').pop();
-      const storagePath = `${session.user.id}/${caseId}/${Date.now()}-${file.name}`;
-
-      const { error: uploadError } = await supabase.storage
-        .from('case-files')
-        .upload(storagePath, file, { upsert: false });
-
-      if (uploadError) { alert('Upload failed: ' + uploadError.message); return; }
-
-      const fileType = file.type.startsWith('image/') ? 'image' : ext === 'pdf' ? 'pdf' : 'other';
-      const res = await apiFetch(`/api/cases/${caseId}/files`, {
-        method: 'POST',
-        body: JSON.stringify({ filename: file.name, storagePath, fileType, fileSize: file.size, documentType: docType, importBatchId }),
-      });
-      const data = await res.json();
-      if (!res.ok) { alert('Intake failed: ' + (data.error || 'Unable to register file')); return importBatchId; }
-      return data.importBatchId || importBatchId;
+      // One labeled batch per drop/selection, created up front so every file
+      // in this intake action shares it.
+      const importBatchId = await createBatch(fileList.length);
+      if (!importBatchId) return;
+      for (const file of Array.from(fileList)) {
+        await uploadFile(file, importBatchId);
+      }
+      await loadFiles();
     } finally {
       setUploading(false);
     }
   }
 
-  async function handleFiles(fileList: FileList | null) {
-    if (!fileList) return;
-    let importBatchId: string | undefined;
-    for (const file of Array.from(fileList)) {
-      importBatchId = await uploadFile(file, importBatchId);
-    }
-    await loadFiles();
-  }
+  const filesByBatch = files.reduce<Record<string, any[]>>((acc, file) => {
+    const key = file.import_batch_id || 'unbatched';
+    (acc[key] ||= []).push(file);
+    return acc;
+  }, {});
 
   return (
     <div className="p-8 max-w-4xl">
@@ -117,19 +162,24 @@ export default function DocumentsPage() {
       </div>
 
       {intake && (
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
           <div className="bg-[#1a1d27] border border-[#2a2d3a] rounded-xl p-4">
             <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><Layers className="w-3.5 h-3.5" /> Import batches</div>
-            <div className="text-2xl font-bold text-white mt-2">{intake.batches?.length || 0}</div>
+            <div className="text-2xl font-bold text-white mt-2">{batches.length || intake.batches?.length || 0}</div>
           </div>
           <div className="bg-[#1a1d27] border border-[#2a2d3a] rounded-xl p-4">
             <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><ScanLine className="w-3.5 h-3.5" /> Pages processed</div>
             <div className="text-2xl font-bold text-white mt-2">{intake.pageCount || 0}</div>
           </div>
           <div className="bg-[#1a1d27] border border-[#2a2d3a] rounded-xl p-4">
+            <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><FileText className="w-3.5 h-3.5" /> Documents detected</div>
+            <div className="text-2xl font-bold text-white mt-2">{intake.documentsDetected || 0}</div>
+          </div>
+          <Link href={`/cases/${caseId}/review`} className="bg-[#1a1d27] border border-[#2a2d3a] hover:border-yellow-500/50 rounded-xl p-4 transition-colors">
             <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><AlertCircle className="w-3.5 h-3.5" /> Low confidence</div>
             <div className="text-2xl font-bold text-white mt-2">{intake.lowConfidencePages || 0}</div>
-          </div>
+            <div className="text-yellow-400/80 text-xs mt-1">Open review queue →</div>
+          </Link>
           <div className="bg-[#1a1d27] border border-[#2a2d3a] rounded-xl p-4">
             <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><Copy className="w-3.5 h-3.5" /> Duplicate pages</div>
             <div className="text-2xl font-bold text-white mt-2">{intake.duplicatePages || 0}</div>
@@ -174,31 +224,76 @@ export default function DocumentsPage() {
         <input ref={fileInput} type="file" multiple accept=".pdf,.jpg,.jpeg,.png,.webp" className="hidden" onChange={e => handleFiles(e.target.files)} />
       </div>
 
-      {/* File list */}
+      {/* Intake batches with their files */}
       {loading ? <div className="text-gray-400">Loading files...</div> : files.length === 0 ? (
         <div className="text-center py-12 text-gray-500">
           <FileText className="w-8 h-8 mx-auto mb-2 opacity-30" />
           <p>No files uploaded yet</p>
         </div>
       ) : (
-        <div className="space-y-2">
-          {files.map(file => (
-            <div key={file.id} className="flex items-center justify-between bg-[#1a1d27] border border-[#2a2d3a] rounded-xl px-5 py-4">
-              <div className="flex items-center gap-3 min-w-0">
-                <FileText className="w-4 h-4 text-gray-500 flex-shrink-0" />
+        <div className="space-y-6">
+          {batches.filter(batch => (filesByBatch[batch.id] || []).length > 0).map(batch => (
+            <div key={batch.id} className="bg-[#141721] border border-[#2a2d3a] rounded-xl p-4">
+              <div className="flex items-center justify-between mb-3">
                 <div className="min-w-0">
-                  <p className="text-white text-sm font-medium truncate">{file.filename}</p>
-                  <p className="text-gray-500 text-xs mt-0.5">
-                    {DOC_TYPES.find(t => t.value === file.document_type)?.label || file.document_type}
-                    {file.import_batches?.label && ` · ${file.import_batches.label}`}
-                    {file.file_size && ` · ${(file.file_size / 1024).toFixed(0)} KB`}
-                    {file.page_count && ` · ${file.page_count} pages`}
+                  <div className="flex items-center gap-2">
+                    <Layers className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+                    <p className="text-white text-sm font-medium truncate">{batch.label || 'Import batch'}</p>
+                  </div>
+                  <p className="text-gray-500 text-xs mt-1">
+                    {batch.stats.fileCount} file{batch.stats.fileCount === 1 ? '' : 's'}
+                    {` · ${batch.stats.pageCount} page${batch.stats.pageCount === 1 ? '' : 's'}`}
+                    {batch.stats.lowConfidencePageCount > 0 && ` · ${batch.stats.lowConfidencePageCount} low confidence`}
+                    {batch.stats.duplicatePageCount > 0 && ` · ${batch.stats.duplicatePageCount} duplicate`}
+                    {` · ${new Date(batch.created_at).toLocaleString()}`}
                   </p>
+                  {batch.error && <p className="text-red-400 text-xs mt-1">{batch.error}</p>}
                 </div>
+                <StatusBadge status={batch.status} />
               </div>
-              <StatusBadge status={file.processing_status} />
+              <div className="space-y-2">
+                {(filesByBatch[batch.id] || []).map(file => (
+                  <div key={file.id} className="flex items-center justify-between bg-[#1a1d27] border border-[#2a2d3a] rounded-xl px-5 py-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <FileText className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                      <div className="min-w-0">
+                        <p className="text-white text-sm font-medium truncate">{file.filename}</p>
+                        <p className="text-gray-500 text-xs mt-0.5">
+                          {DOC_TYPES.find(t => t.value === file.document_type)?.label || file.document_type}
+                          {file.file_size && ` · ${(file.file_size / 1024).toFixed(0)} KB`}
+                          {file.page_count && ` · ${file.page_count} page${file.page_count === 1 ? '' : 's'}`}
+                          {file.processing_error && <span className="text-red-400"> · {file.processing_error}</span>}
+                        </p>
+                      </div>
+                    </div>
+                    <StatusBadge status={file.processing_status} />
+                  </div>
+                ))}
+              </div>
             </div>
           ))}
+
+          {(filesByBatch['unbatched'] || []).length > 0 && (
+            <div className="space-y-2">
+              <p className="text-gray-400 text-xs uppercase tracking-wide">Not in a batch</p>
+              {filesByBatch['unbatched'].map(file => (
+                <div key={file.id} className="flex items-center justify-between bg-[#1a1d27] border border-[#2a2d3a] rounded-xl px-5 py-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <FileText className="w-4 h-4 text-gray-500 flex-shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-white text-sm font-medium truncate">{file.filename}</p>
+                      <p className="text-gray-500 text-xs mt-0.5">
+                        {DOC_TYPES.find(t => t.value === file.document_type)?.label || file.document_type}
+                        {file.file_size && ` · ${(file.file_size / 1024).toFixed(0)} KB`}
+                        {file.page_count && ` · ${file.page_count} pages`}
+                      </p>
+                    </div>
+                  </div>
+                  <StatusBadge status={file.processing_status} />
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
