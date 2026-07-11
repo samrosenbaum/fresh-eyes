@@ -4,7 +4,7 @@ import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { apiFetch } from '@/lib/auth';
 import { supabase } from '@/lib/supabase';
-import { ArrowLeft, Upload, CheckCircle, Clock, AlertCircle, Loader2, FileText } from 'lucide-react';
+import { ArrowLeft, Upload, CheckCircle, Clock, AlertCircle, Loader2, FileText, Layers, Copy, ScanLine } from 'lucide-react';
 
 const DOC_TYPES = [
   { value: 'police_report', label: 'Police Report' },
@@ -37,6 +37,7 @@ function StatusBadge({ status }: { status: string }) {
 export default function DocumentsPage() {
   const { caseId } = useParams<{ caseId: string }>();
   const [files, setFiles] = useState<any[]>([]);
+  const [intake, setIntake] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [docType, setDocType] = useState('other');
@@ -48,6 +49,7 @@ export default function DocumentsPage() {
     const res = await apiFetch(`/api/cases/${caseId}/files`);
     const data = await res.json();
     setFiles(data.files || []);
+    setIntake(data.intake || null);
     return data.files || [];
   }, [caseId]);
 
@@ -67,7 +69,7 @@ export default function DocumentsPage() {
     return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
   }, [files, loadFiles]);
 
-  async function uploadFile(file: File) {
+  async function uploadFile(file: File, importBatchId?: string) {
     setUploading(true);
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -83,12 +85,13 @@ export default function DocumentsPage() {
       if (uploadError) { alert('Upload failed: ' + uploadError.message); return; }
 
       const fileType = file.type.startsWith('image/') ? 'image' : ext === 'pdf' ? 'pdf' : 'other';
-      await apiFetch(`/api/cases/${caseId}/files`, {
+      const res = await apiFetch(`/api/cases/${caseId}/files`, {
         method: 'POST',
-        body: JSON.stringify({ filename: file.name, storagePath, fileType, fileSize: file.size, documentType: docType }),
+        body: JSON.stringify({ filename: file.name, storagePath, fileType, fileSize: file.size, documentType: docType, importBatchId }),
       });
-
-      await loadFiles();
+      const data = await res.json();
+      if (!res.ok) { alert('Intake failed: ' + (data.error || 'Unable to register file')); return importBatchId; }
+      return data.importBatchId || importBatchId;
     } finally {
       setUploading(false);
     }
@@ -96,9 +99,11 @@ export default function DocumentsPage() {
 
   async function handleFiles(fileList: FileList | null) {
     if (!fileList) return;
+    let importBatchId: string | undefined;
     for (const file of Array.from(fileList)) {
-      await uploadFile(file);
+      importBatchId = await uploadFile(file, importBatchId);
     }
+    await loadFiles();
   }
 
   return (
@@ -106,7 +111,31 @@ export default function DocumentsPage() {
       <Link href={`/cases/${caseId}`} className="flex items-center gap-2 text-gray-400 hover:text-white text-sm mb-6 transition-colors">
         <ArrowLeft className="w-4 h-4" /> Back to case
       </Link>
-      <h1 className="text-2xl font-bold text-white mb-6">Documents</h1>
+      <div className="mb-6">
+        <h1 className="text-2xl font-bold text-white">Documents</h1>
+        <p className="text-gray-400 text-sm mt-1">Case intake foundation: group uploads into batches, track page-level OCR, and flag duplicate or low-confidence pages.</p>
+      </div>
+
+      {intake && (
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-6">
+          <div className="bg-[#1a1d27] border border-[#2a2d3a] rounded-xl p-4">
+            <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><Layers className="w-3.5 h-3.5" /> Import batches</div>
+            <div className="text-2xl font-bold text-white mt-2">{intake.batches?.length || 0}</div>
+          </div>
+          <div className="bg-[#1a1d27] border border-[#2a2d3a] rounded-xl p-4">
+            <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><ScanLine className="w-3.5 h-3.5" /> Pages processed</div>
+            <div className="text-2xl font-bold text-white mt-2">{intake.pageCount || 0}</div>
+          </div>
+          <div className="bg-[#1a1d27] border border-[#2a2d3a] rounded-xl p-4">
+            <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><AlertCircle className="w-3.5 h-3.5" /> Low confidence</div>
+            <div className="text-2xl font-bold text-white mt-2">{intake.lowConfidencePages || 0}</div>
+          </div>
+          <div className="bg-[#1a1d27] border border-[#2a2d3a] rounded-xl p-4">
+            <div className="flex items-center gap-2 text-gray-400 text-xs uppercase tracking-wide"><Copy className="w-3.5 h-3.5" /> Duplicate pages</div>
+            <div className="text-2xl font-bold text-white mt-2">{intake.duplicatePages || 0}</div>
+          </div>
+        </div>
+      )}
 
       {/* Upload area */}
       <div className="mb-6">
@@ -161,6 +190,7 @@ export default function DocumentsPage() {
                   <p className="text-white text-sm font-medium truncate">{file.filename}</p>
                   <p className="text-gray-500 text-xs mt-0.5">
                     {DOC_TYPES.find(t => t.value === file.document_type)?.label || file.document_type}
+                    {file.import_batches?.label && ` · ${file.import_batches.label}`}
                     {file.file_size && ` · ${(file.file_size / 1024).toFixed(0)} KB`}
                     {file.page_count && ` · ${file.page_count} pages`}
                   </p>

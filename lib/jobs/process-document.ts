@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { inngest } from '@/lib/inngest';
 import { supabaseAdmin } from '@/lib/supabase';
 import { transcribeImage, transcribePdfDocument } from '@/lib/ai/tasks/ocr';
@@ -26,6 +27,25 @@ async function extractPdfText(buffer: Buffer): Promise<{ text: string; method: s
   // page-level OCR, but the provider-specific call is intentionally isolated.
   const text = await transcribePdfDocument({ pdfBuffer: buffer });
   return { text, method: 'ai-vision', pageCount: 1 };
+}
+
+function buildPageRecords(text: string, pageCount: number) {
+  const pages = text.includes('\f') ? text.split('\f') : [];
+  if (pages.length >= pageCount) {
+    return pages.slice(0, pageCount).map(pageText => pageText.trim());
+  }
+
+  if (pageCount <= 1) return [text];
+
+  const chunkSize = Math.max(1, Math.ceil(text.length / pageCount));
+  return Array.from({ length: pageCount }, (_, index) => text.slice(index * chunkSize, (index + 1) * chunkSize).trim());
+}
+
+function fingerprintText(text: string) {
+  return crypto
+    .createHash('sha256')
+    .update(text.toLowerCase().replace(/\s+/g, ' ').trim())
+    .digest('hex');
 }
 
 async function performOcr(buffer: Buffer, fileType: string, storagePath: string): Promise<{ text: string; method: string; pageCount: number }> {
@@ -122,13 +142,16 @@ export const processDocumentJob = inngest.createFunction(
     triggers: { event: 'document/uploaded' },
   },
   async ({ event, step }) => {
-    const { caseId, fileId, storagePath, fileType, documentType } = event.data;
+    const { caseId, fileId, importBatchId, storagePath, fileType, documentType } = event.data;
 
     // Mark as processing
     await step.run('mark-processing', async () => {
       await supabaseAdmin.from('case_files').update({
         processing_status: 'processing',
       }).eq('id', fileId);
+      if (importBatchId) {
+        await supabaseAdmin.from('import_batches').update({ status: 'processing' }).eq('id', importBatchId);
+      }
     });
 
     // Download file from storage
@@ -145,13 +168,46 @@ export const processDocumentJob = inngest.createFunction(
       return performOcr(buf, fileType, storagePath);
     });
 
-    // Store OCR result
-    await step.run('store-ocr', async () => {
+    // Store OCR result and page-level intake records
+    const sourcePageIds = await step.run('store-ocr', async () => {
       await supabaseAdmin.from('case_files').update({
         ocr_text: text,
         ocr_method: method,
         page_count: pageCount,
       }).eq('id', fileId);
+
+      const pageTexts = buildPageRecords(text, pageCount);
+      const pageIds: string[] = [];
+
+      for (const [index, pageText] of pageTexts.entries()) {
+        const pageFingerprint = fingerprintText(pageText);
+        const { data: duplicate } = await supabaseAdmin
+          .from('document_pages')
+          .select('id')
+          .eq('case_id', caseId)
+          .eq('page_fingerprint', pageFingerprint)
+          .neq('file_id', fileId)
+          .limit(1)
+          .maybeSingle();
+
+        const { data: page, error: pageError } = await supabaseAdmin.from('document_pages').upsert({
+          case_id: caseId,
+          file_id: fileId,
+          import_batch_id: importBatchId || null,
+          page_number: index + 1,
+          ocr_text: pageText,
+          ocr_confidence: method === 'pdf-text' ? 0.98 : 0.82,
+          ocr_method: method,
+          page_fingerprint: pageFingerprint,
+          duplicate_of_page_id: duplicate?.id || null,
+          processing_status: 'complete',
+        }, { onConflict: 'file_id,page_number' }).select('id').single();
+
+        if (pageError) throw new Error(`Failed to store page ${index + 1}: ${pageError.message}`);
+        pageIds.push(page.id);
+      }
+
+      return pageIds;
     });
 
     // Extract entities, relationships, statements, timeline
@@ -162,6 +218,8 @@ export const processDocumentJob = inngest.createFunction(
 
     // Store everything in graph
     await step.run('store-graph', async () => {
+      const firstSourcePageId = sourcePageIds[0] || null;
+
       // Build entity name → id map
       const entityIdMap: Record<string, string> = {};
 
@@ -183,6 +241,9 @@ export const processDocumentJob = inngest.createFunction(
           entity_id: entityId,
           file_id: fileId,
           context_text: `Mentioned in ${documentType}`,
+          page_number: firstSourcePageId ? 1 : null,
+          confidence: 0.8,
+          review_status: 'pending',
         }).then(() => {}); // ignore duplicates
       }
 
@@ -198,6 +259,8 @@ export const processDocumentJob = inngest.createFunction(
             relationship_type: rel.type,
             description: rel.description,
             source_file_id: fileId,
+            source_page_id: firstSourcePageId,
+            source_quote: rel.description,
           });
         }
       }
@@ -214,6 +277,10 @@ export const processDocumentJob = inngest.createFunction(
           statement_time: stmt.time || null,
           content: stmt.content,
           about_entity_ids: aboutIds,
+          source_page_id: firstSourcePageId,
+          source_quote: stmt.content,
+          confidence: 0.8,
+          review_status: 'pending',
         });
       }
 
@@ -228,6 +295,8 @@ export const processDocumentJob = inngest.createFunction(
           description: event.description,
           involved_entity_ids: involvedIds,
           source_file_id: fileId,
+          source_page_id: firstSourcePageId,
+          source_quote: event.description,
         });
       }
     });
@@ -238,6 +307,25 @@ export const processDocumentJob = inngest.createFunction(
         processing_status: 'complete',
         processed_at: new Date().toISOString(),
       }).eq('id', fileId);
+
+      if (importBatchId) {
+        const [{ count: fileCount }, { count: completedCount }, { count: pageCount }, { count: lowConfidencePageCount }, { count: duplicatePageCount }] = await Promise.all([
+          supabaseAdmin.from('case_files').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId),
+          supabaseAdmin.from('case_files').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId).eq('processing_status', 'complete'),
+          supabaseAdmin.from('document_pages').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId),
+          supabaseAdmin.from('document_pages').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId).lt('ocr_confidence', 0.75),
+          supabaseAdmin.from('document_pages').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId).not('duplicate_of_page_id', 'is', null),
+        ]);
+
+        await supabaseAdmin.from('import_batches').update({
+          status: fileCount && completedCount === fileCount ? 'complete' : 'processing',
+          file_count: fileCount || 0,
+          page_count: pageCount || 0,
+          low_confidence_page_count: lowConfidencePageCount || 0,
+          duplicate_page_count: duplicatePageCount || 0,
+          completed_at: fileCount && completedCount === fileCount ? new Date().toISOString() : null,
+        }).eq('id', importBatchId);
+      }
     });
 
     return { fileId, entityCount: extracted.entities.length };

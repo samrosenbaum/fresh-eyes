@@ -10,13 +10,31 @@ create table if not exists cases (
   incident_location text,
   status text default 'active',
   created_by uuid references auth.users,
-  created_at timestamptz default now()
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Import batches group one intake action across many uploaded files
+create table if not exists import_batches (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid references cases on delete cascade not null,
+  uploaded_by uuid references auth.users,
+  label text,
+  status text default 'pending', -- 'pending' | 'processing' | 'complete' | 'failed'
+  file_count int default 0,
+  page_count int default 0,
+  low_confidence_page_count int default 0,
+  duplicate_page_count int default 0,
+  missing_reference_count int default 0,
+  created_at timestamptz default now(),
+  completed_at timestamptz
 );
 
 -- Uploaded files
 create table if not exists case_files (
   id uuid primary key default gen_random_uuid(),
   case_id uuid references cases on delete cascade not null,
+  import_batch_id uuid references import_batches on delete set null,
   filename text not null,
   storage_path text not null,
   file_type text,                           -- 'pdf' | 'image' | 'audio'
@@ -30,6 +48,23 @@ create table if not exists case_files (
   processing_error text,
   processed_at timestamptz,
   created_at timestamptz default now()
+);
+
+-- Page-level processing records for source traceability and intake QA
+create table if not exists document_pages (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid references cases on delete cascade not null,
+  file_id uuid references case_files on delete cascade not null,
+  import_batch_id uuid references import_batches on delete set null,
+  page_number int not null,
+  ocr_text text,
+  ocr_confidence float,
+  ocr_method text,
+  page_fingerprint text,
+  duplicate_of_page_id uuid references document_pages,
+  processing_status text default 'pending',
+  created_at timestamptz default now(),
+  unique(file_id, page_number)
 );
 
 -- Entities: people, locations, organizations, vehicles, evidence items
@@ -53,6 +88,9 @@ create table if not exists entity_mentions (
   file_id uuid references case_files on delete cascade not null,
   page_number int,
   context_text text,
+  source_quote text,
+  confidence float default 1.0,
+  review_status text default 'pending',
   created_at timestamptz default now()
 );
 
@@ -65,6 +103,8 @@ create table if not exists relationships (
   relationship_type text,  -- 'knows' | 'was_with' | 'alibi_for' | 'married_to' | 'employed_by' | 'witnessed' | 'owns'
   description text,
   source_file_id uuid references case_files,
+  source_page_id uuid references document_pages,
+  source_quote text,
   confidence float default 1.0,
   created_at timestamptz default now()
 );
@@ -79,6 +119,10 @@ create table if not exists statements (
   statement_time time,
   content text not null,
   about_entity_ids uuid[] default '{}',
+  source_page_id uuid references document_pages,
+  source_quote text,
+  confidence float default 1.0,
+  review_status text default 'pending',
   created_at timestamptz default now()
 );
 
@@ -92,6 +136,8 @@ create table if not exists timeline_events (
   description text not null,
   involved_entity_ids uuid[] default '{}',
   source_file_id uuid references case_files,
+  source_page_id uuid references document_pages,
+  source_quote text,
   confidence float default 1.0,
   created_at timestamptz default now()
 );
@@ -127,7 +173,9 @@ create table if not exists case_reports (
 
 -- RLS
 alter table cases enable row level security;
+alter table import_batches enable row level security;
 alter table case_files enable row level security;
+alter table document_pages enable row level security;
 alter table entities enable row level security;
 alter table entity_mentions enable row level security;
 alter table relationships enable row level security;
@@ -141,7 +189,13 @@ create policy "users own cases" on cases
   for all using (created_by = auth.uid());
 
 -- All case data is accessible if you own the case
+create policy "import_batches access" on import_batches
+  for all using (case_id in (select id from cases where created_by = auth.uid()));
+
 create policy "case_files access" on case_files
+  for all using (case_id in (select id from cases where created_by = auth.uid()));
+
+create policy "document_pages access" on document_pages
   for all using (case_id in (select id from cases where created_by = auth.uid()));
 
 create policy "entities access" on entities
@@ -168,3 +222,19 @@ create policy "case_reports access" on case_reports
 -- Storage bucket (run separately if needed)
 -- insert into storage.buckets (id, name, public) values ('case-files', 'case-files', false);
 -- create policy "case file uploads" on storage.objects for all using (bucket_id = 'case-files' and auth.uid() is not null);
+
+
+-- Additive migrations for existing FreshEyes v2 databases
+alter table cases add column if not exists updated_at timestamptz default now();
+alter table case_files add column if not exists import_batch_id uuid references import_batches on delete set null;
+alter table entity_mentions add column if not exists source_quote text;
+alter table entity_mentions add column if not exists confidence float default 1.0;
+alter table entity_mentions add column if not exists review_status text default 'pending';
+alter table relationships add column if not exists source_page_id uuid references document_pages;
+alter table relationships add column if not exists source_quote text;
+alter table statements add column if not exists source_page_id uuid references document_pages;
+alter table statements add column if not exists source_quote text;
+alter table statements add column if not exists confidence float default 1.0;
+alter table statements add column if not exists review_status text default 'pending';
+alter table timeline_events add column if not exists source_page_id uuid references document_pages;
+alter table timeline_events add column if not exists source_quote text;
