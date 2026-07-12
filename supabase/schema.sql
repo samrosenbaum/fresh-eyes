@@ -394,13 +394,8 @@ create table if not exists case_documents (
   created_at timestamptz default now()
 );
 alter table case_documents enable row level security;
-do $$
-begin
-  if not exists (select 1 from pg_policies where tablename = 'case_documents' and policyname = 'case_documents access') then
-    create policy "case_documents access" on case_documents
-      for all using (case_id in (select id from cases where created_by = auth.uid()));
-  end if;
-end $$;
+drop policy if exists "case_documents access" on case_documents;
+create policy "case_documents access" on case_documents for all using (case_id in (select id from cases where created_by = auth.uid()));
 create index if not exists case_documents_file_idx on case_documents (file_id);
 
 -- Entity resolution migrations
@@ -424,34 +419,20 @@ create table if not exists entity_merge_proposals (
   unique(primary_entity_id, duplicate_entity_id)
 );
 alter table entity_merge_proposals enable row level security;
-do $$
-begin
-  if not exists (select 1 from pg_policies where tablename = 'entity_merge_proposals' and policyname = 'entity_merge_proposals access') then
-    create policy "entity_merge_proposals access" on entity_merge_proposals
-      for all using (case_id in (select id from cases where created_by = auth.uid()));
-  end if;
-end $$;
+drop policy if exists "entity_merge_proposals access" on entity_merge_proposals;
+create policy "entity_merge_proposals access" on entity_merge_proposals for all using (case_id in (select id from cases where created_by = auth.uid()));
 create index if not exists entity_merge_proposals_case_idx on entity_merge_proposals (case_id, status);
 
 -- Evidence & gaps migrations
 -- (tables are defined above with `if not exists`; for an existing database,
 -- re-run the three create-table blocks for evidence_items, evidence_tests,
 -- and open_loops, or run this whole file's additive section)
-do $$
-begin
-  if not exists (select 1 from pg_policies where tablename = 'evidence_items' and policyname = 'evidence_items access') then
-    create policy "evidence_items access" on evidence_items
-      for all using (case_id in (select id from cases where created_by = auth.uid()));
-  end if;
-  if not exists (select 1 from pg_policies where tablename = 'evidence_tests' and policyname = 'evidence_tests access') then
-    create policy "evidence_tests access" on evidence_tests
-      for all using (case_id in (select id from cases where created_by = auth.uid()));
-  end if;
-  if not exists (select 1 from pg_policies where tablename = 'open_loops' and policyname = 'open_loops access') then
-    create policy "open_loops access" on open_loops
-      for all using (case_id in (select id from cases where created_by = auth.uid()));
-  end if;
-end $$;
+drop policy if exists "evidence_items access" on evidence_items;
+create policy "evidence_items access" on evidence_items for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "evidence_tests access" on evidence_tests;
+create policy "evidence_tests access" on evidence_tests for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "open_loops access" on open_loops;
+create policy "open_loops access" on open_loops for all using (case_id in (select id from cases where created_by = auth.uid()));
 create index if not exists evidence_items_case_idx on evidence_items (case_id, status);
 create index if not exists evidence_tests_item_idx on evidence_tests (evidence_item_id);
 create index if not exists open_loops_case_idx on open_loops (case_id, status);
