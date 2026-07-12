@@ -22,6 +22,9 @@ type Events = {
       endPage: number;
     };
   };
+  'analysis/resolve-entities': {
+    data: { caseId: string };
+  };
   'analysis/detect-contradictions': {
     data: { caseId: string };
   };
