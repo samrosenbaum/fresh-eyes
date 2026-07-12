@@ -113,6 +113,29 @@ create table if not exists entity_mentions (
   created_at timestamptz default now()
 );
 
+-- Proposed entity merges from the resolution pass. Nothing merges without a
+-- recorded, human-reviewable proposal; accepted merges keep a full snapshot
+-- of both entities for auditability.
+create table if not exists entity_merge_proposals (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid references cases on delete cascade not null,
+  -- set null (not cascade) so accepted proposals survive as audit records
+  -- after the duplicate entity is deleted by the merge itself
+  primary_entity_id uuid references entities on delete set null,
+  duplicate_entity_id uuid references entities on delete set null,
+  score float,
+  signals text[] default '{}',        -- 'exact_name' | 'name_contains' | 'initial_match' | 'token_overlap' | 'shared_phone' | 'shared_plate' | 'shared_address'
+  ai_verdict text,                    -- 'same' | 'different' | 'unsure'
+  ai_confidence float,
+  ai_reasoning text,
+  status text default 'proposed',     -- 'proposed' | 'accepted' | 'rejected' | 'ai_rejected' | 'superseded'
+  resolved_by uuid references auth.users,
+  resolved_at timestamptz,
+  merged_snapshot jsonb,              -- audit copy of both entities at merge time
+  created_at timestamptz default now(),
+  unique(primary_entity_id, duplicate_entity_id)
+);
+
 -- Relationships between entities
 create table if not exists relationships (
   id uuid primary key default gen_random_uuid(),
@@ -200,6 +223,7 @@ alter table case_files enable row level security;
 alter table document_pages enable row level security;
 alter table case_documents enable row level security;
 alter table entities enable row level security;
+alter table entity_merge_proposals enable row level security;
 alter table entity_mentions enable row level security;
 alter table relationships enable row level security;
 alter table statements enable row level security;
@@ -225,6 +249,9 @@ create policy "case_documents access" on case_documents
   for all using (case_id in (select id from cases where created_by = auth.uid()));
 
 create policy "entities access" on entities
+  for all using (case_id in (select id from cases where created_by = auth.uid()));
+
+create policy "entity_merge_proposals access" on entity_merge_proposals
   for all using (case_id in (select id from cases where created_by = auth.uid()));
 
 create policy "entity_mentions access" on entity_mentions
@@ -305,3 +332,33 @@ begin
   end if;
 end $$;
 create index if not exists case_documents_file_idx on case_documents (file_id);
+
+-- Entity resolution migrations
+create table if not exists entity_merge_proposals (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid references cases on delete cascade not null,
+  -- set null (not cascade) so accepted proposals survive as audit records
+  -- after the duplicate entity is deleted by the merge itself
+  primary_entity_id uuid references entities on delete set null,
+  duplicate_entity_id uuid references entities on delete set null,
+  score float,
+  signals text[] default '{}',
+  ai_verdict text,
+  ai_confidence float,
+  ai_reasoning text,
+  status text default 'proposed',
+  resolved_by uuid references auth.users,
+  resolved_at timestamptz,
+  merged_snapshot jsonb,
+  created_at timestamptz default now(),
+  unique(primary_entity_id, duplicate_entity_id)
+);
+alter table entity_merge_proposals enable row level security;
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename = 'entity_merge_proposals' and policyname = 'entity_merge_proposals access') then
+    create policy "entity_merge_proposals access" on entity_merge_proposals
+      for all using (case_id in (select id from cases where created_by = auth.uid()));
+  end if;
+end $$;
+create index if not exists entity_merge_proposals_case_idx on entity_merge_proposals (case_id, status);
