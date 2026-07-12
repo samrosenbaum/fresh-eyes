@@ -8,6 +8,12 @@ import { prepareVerificationPages, verifyQuote, SourceVerificationStatus } from 
 import { downloadFile, getPdfPageCount, loadStoredPages, storePage, IMAGE_MEDIA_TYPES } from '@/lib/intake/pages';
 import { ocrPageChunkJob } from '@/lib/jobs/ocr-page-chunk';
 import { DocumentSegment } from '@/lib/intake/segments';
+import {
+  mostAdvancedStatus,
+  normalizeEvidenceCategory,
+  normalizeEvidenceLabel,
+  normalizeEvidenceStatus,
+} from '@/lib/evidence';
 
 // Pages per fanned-out OCR invocation. Small enough that a retry redoes only
 // a few AI calls; the ocr-page-chunk function's concurrency limit governs how
@@ -85,6 +91,66 @@ async function resolveOrCreateEntity(
   }).select('id').single();
 
   if (error) throw new Error(`Failed to create entity: ${error.message}`);
+  return data.id;
+}
+
+// ── Evidence Deduplication ──────────────────────────────────────────────────
+
+// Evidence items are case-shared like entities: any document mentioning
+// "Item #12 — blue sweater" resolves to one inventory row; testing status
+// only ever advances (collected → submitted → tested).
+async function resolveOrCreateEvidenceItem(caseId: string, input: {
+  label: string;
+  category: string;
+  description: string | null;
+  status: string;
+  collectedDate: string | null;
+  collectedLocation: string | null;
+  sourceFileId: string;
+  sourcePageId: string | null;
+  sourceQuote: string | null;
+  sourceVerification: string;
+  confidence: number;
+}): Promise<string> {
+  const normalizedLabel = normalizeEvidenceLabel(input.label);
+  const status = normalizeEvidenceStatus(input.status);
+
+  const { data: existing } = await supabaseAdmin
+    .from('evidence_items')
+    .select('id, status, description, collected_date, collected_location')
+    .eq('case_id', caseId)
+    .eq('normalized_label', normalizedLabel)
+    .maybeSingle();
+
+  if (existing) {
+    const { error } = await supabaseAdmin.from('evidence_items').update({
+      status: mostAdvancedStatus(existing.status, status),
+      description: existing.description || input.description,
+      collected_date: existing.collected_date || input.collectedDate,
+      collected_location: existing.collected_location || input.collectedLocation,
+      updated_at: new Date().toISOString(),
+    }).eq('id', existing.id);
+    if (error) throw new Error(`Failed to update evidence item: ${error.message}`);
+    return existing.id;
+  }
+
+  const { data, error } = await supabaseAdmin.from('evidence_items').insert({
+    case_id: caseId,
+    label: input.label,
+    normalized_label: normalizedLabel,
+    category: normalizeEvidenceCategory(input.category),
+    description: input.description,
+    status,
+    collected_date: input.collectedDate,
+    collected_location: input.collectedLocation,
+    source_file_id: input.sourceFileId,
+    source_page_id: input.sourcePageId,
+    source_quote: input.sourceQuote,
+    source_verification: input.sourceVerification,
+    confidence: input.confidence,
+  }).select('id').single();
+
+  if (error) throw new Error(`Failed to create evidence item: ${error.message}`);
   return data.id;
 }
 
@@ -294,6 +360,10 @@ export const processDocumentJob = inngest.createFunction(
         supabaseAdmin.from('relationships').delete().eq('source_file_id', fileId),
         supabaseAdmin.from('statements').delete().eq('source_file_id', fileId),
         supabaseAdmin.from('timeline_events').delete().eq('source_file_id', fileId),
+        // Evidence items are case-shared (resolved by label, like entities)
+        // and are not deleted; their tests and open loops are per-file.
+        supabaseAdmin.from('evidence_tests').delete().eq('source_file_id', fileId),
+        supabaseAdmin.from('open_loops').delete().eq('source_file_id', fileId),
       ]);
       for (const cleanup of cleanups) {
         if (cleanup.error) throw new Error(`Failed to clear previous extraction: ${cleanup.error.message}`);
@@ -404,6 +474,89 @@ export const processDocumentJob = inngest.createFunction(
             confidence: cited.confidence,
           });
           if (error) throw new Error(`Failed to store timeline event: ${error.message}`);
+        }
+
+        // Evidence inventory — resolve items case-wide by label, then attach
+        // any reported test results; items with no results are the "untested
+        // evidence" gap the gaps engine surfaces.
+        const evidenceIdByLabel: Record<string, string> = {};
+
+        for (const item of extracted.evidence_items) {
+          const cited = citeSource(item.quote, item.page);
+          const evidenceId = await resolveOrCreateEvidenceItem(caseId, {
+            label: item.label,
+            category: item.category,
+            description: item.description,
+            status: item.status,
+            collectedDate: item.collected_date,
+            collectedLocation: item.collected_location,
+            sourceFileId: fileId,
+            sourcePageId: cited.source_page_id,
+            sourceQuote: cited.source_quote,
+            sourceVerification: cited.source_verification,
+            confidence: cited.confidence,
+          });
+          evidenceIdByLabel[normalizeEvidenceLabel(item.label)] = evidenceId;
+        }
+
+        for (const test of extracted.evidence_tests) {
+          const normalizedLabel = normalizeEvidenceLabel(test.evidence_label);
+          // A result for an item we haven't inventoried yet still creates the
+          // item — a lab report may be the only place it's mentioned.
+          const evidenceId = evidenceIdByLabel[normalizedLabel]
+            || await resolveOrCreateEvidenceItem(caseId, {
+              label: test.evidence_label,
+              category: 'other',
+              description: null,
+              status: 'tested',
+              collectedDate: null,
+              collectedLocation: null,
+              sourceFileId: fileId,
+              sourcePageId: null,
+              sourceQuote: test.quote,
+              sourceVerification: 'unverified',
+              confidence: 0.5,
+            });
+          evidenceIdByLabel[normalizedLabel] = evidenceId;
+
+          const cited = citeSource(test.quote, test.page);
+          const { error } = await supabaseAdmin.from('evidence_tests').insert({
+            case_id: caseId,
+            evidence_item_id: evidenceId,
+            test_type: test.test_type || 'other',
+            result_summary: test.result_summary,
+            tested_date: test.tested_date || null,
+            lab_name: test.lab_name,
+            source_file_id: fileId,
+            source_page_id: cited.source_page_id,
+            source_quote: cited.source_quote,
+            source_verification: cited.source_verification,
+          });
+          if (error) throw new Error(`Failed to store evidence test: ${error.message}`);
+
+          // A reported result advances the item to tested.
+          await supabaseAdmin.from('evidence_items')
+            .update({ status: 'tested', updated_at: new Date().toISOString() })
+            .eq('id', evidenceId);
+        }
+
+        // Open loops — promised investigative actions with no located completion
+        for (const loop of extracted.open_loops) {
+          const involvedIds = (loop.people || []).map(resolveEntityId).filter(Boolean) as string[];
+          const cited = citeSource(loop.quote, loop.page);
+          const { error } = await supabaseAdmin.from('open_loops').insert({
+            case_id: caseId,
+            description: loop.description,
+            loop_type: loop.loop_type || 'other',
+            raised_date: loop.raised_date || null,
+            involved_entity_ids: involvedIds,
+            status: 'open',
+            source_file_id: fileId,
+            source_page_id: cited.source_page_id,
+            source_quote: cited.source_quote,
+            source_verification: cited.source_verification,
+          });
+          if (error) throw new Error(`Failed to store open loop: ${error.message}`);
         }
       }
 

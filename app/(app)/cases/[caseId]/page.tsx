@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { apiFetch } from '@/lib/auth';
-import { FileText, Users, AlertTriangle, Clock, FileSearch, ChevronRight } from 'lucide-react';
+import { FileText, Users, AlertTriangle, Clock, FileSearch, ChevronRight, FlaskConical } from 'lucide-react';
 
 export default function CaseOverviewPage() {
   const { caseId } = useParams<{ caseId: string }>();
@@ -39,6 +39,7 @@ export default function CaseOverviewPage() {
     { href: `/cases/${caseId}/entities`, label: 'Persons & Entities', icon: Users, count: stats.entities },
     { href: `/cases/${caseId}/contradictions`, label: 'Contradictions', icon: AlertTriangle, count: stats.contradictions, badge: stats.critical ? `${stats.critical} critical` : null, badgeColor: 'red' },
     { href: `/cases/${caseId}/timeline`, label: 'Timeline', icon: Clock },
+    { href: `/cases/${caseId}/gaps`, label: 'Investigative Gaps', icon: FlaskConical },
     { href: `/cases/${caseId}/report`, label: 'Investigation Report', icon: FileSearch },
   ];
 
