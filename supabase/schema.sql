@@ -293,54 +293,54 @@ alter table contradictions enable row level security;
 alter table case_reports enable row level security;
 
 -- Case ownership
-create policy "users own cases" on cases
-  for all using (created_by = auth.uid());
+drop policy if exists "users own cases" on cases;
+create policy "users own cases" on cases for all using (created_by = auth.uid());
 
 -- All case data is accessible if you own the case
-create policy "import_batches access" on import_batches
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "import_batches access" on import_batches;
+create policy "import_batches access" on import_batches for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "case_files access" on case_files
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "case_files access" on case_files;
+create policy "case_files access" on case_files for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "document_pages access" on document_pages
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "document_pages access" on document_pages;
+create policy "document_pages access" on document_pages for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "case_documents access" on case_documents
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "case_documents access" on case_documents;
+create policy "case_documents access" on case_documents for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "entities access" on entities
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "entities access" on entities;
+create policy "entities access" on entities for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "entity_merge_proposals access" on entity_merge_proposals
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "entity_merge_proposals access" on entity_merge_proposals;
+create policy "entity_merge_proposals access" on entity_merge_proposals for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "entity_mentions access" on entity_mentions
-  for all using (entity_id in (select id from entities where case_id in (select id from cases where created_by = auth.uid())));
+drop policy if exists "entity_mentions access" on entity_mentions;
+create policy "entity_mentions access" on entity_mentions for all using (entity_id in (select id from entities where case_id in (select id from cases where created_by = auth.uid())));
 
-create policy "relationships access" on relationships
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "relationships access" on relationships;
+create policy "relationships access" on relationships for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "statements access" on statements
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "statements access" on statements;
+create policy "statements access" on statements for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "timeline_events access" on timeline_events
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "timeline_events access" on timeline_events;
+create policy "timeline_events access" on timeline_events for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "evidence_items access" on evidence_items
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "evidence_items access" on evidence_items;
+create policy "evidence_items access" on evidence_items for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "evidence_tests access" on evidence_tests
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "evidence_tests access" on evidence_tests;
+create policy "evidence_tests access" on evidence_tests for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "open_loops access" on open_loops
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "open_loops access" on open_loops;
+create policy "open_loops access" on open_loops for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "contradictions access" on contradictions
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "contradictions access" on contradictions;
+create policy "contradictions access" on contradictions for all using (case_id in (select id from cases where created_by = auth.uid()));
 
-create policy "case_reports access" on case_reports
-  for all using (case_id in (select id from cases where created_by = auth.uid()));
+drop policy if exists "case_reports access" on case_reports;
+create policy "case_reports access" on case_reports for all using (case_id in (select id from cases where created_by = auth.uid()));
 
 -- Storage bucket (run separately if needed)
 -- insert into storage.buckets (id, name, public) values ('case-files', 'case-files', false);
