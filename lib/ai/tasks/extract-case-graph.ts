@@ -44,11 +44,44 @@ export interface ExtractedTimelineEvent {
   quote: string | null;
 }
 
+export interface ExtractedEvidenceItem {
+  label: string;
+  category: string;
+  description: string | null;
+  status: string;
+  collected_date: string | null;
+  collected_location: string | null;
+  page: number | null;
+  quote: string | null;
+}
+
+export interface ExtractedEvidenceTest {
+  evidence_label: string;
+  test_type: string;
+  result_summary: string | null;
+  tested_date: string | null;
+  lab_name: string | null;
+  page: number | null;
+  quote: string | null;
+}
+
+export interface ExtractedOpenLoop {
+  description: string;
+  loop_type: string;
+  raised_date: string | null;
+  people: string[];
+  page: number | null;
+  quote: string | null;
+}
+
 export interface ExtractedCaseGraph {
   entities: ExtractedEntity[];
   relationships: ExtractedRelationship[];
   statements: ExtractedStatement[];
   timeline_events: ExtractedTimelineEvent[];
+  evidence_items: ExtractedEvidenceItem[];
+  evidence_tests: ExtractedEvidenceTest[];
+  open_loops: ExtractedOpenLoop[];
 }
 
 export const EMPTY_CASE_GRAPH: ExtractedCaseGraph = {
@@ -56,6 +89,9 @@ export const EMPTY_CASE_GRAPH: ExtractedCaseGraph = {
   relationships: [],
   statements: [],
   timeline_events: [],
+  evidence_items: [],
+  evidence_tests: [],
+  open_loops: [],
 };
 
 export interface SourcePageText {
@@ -105,5 +141,8 @@ export async function extractCaseGraphFromDocument(input: {
     relationships: graph.relationships || [],
     statements: graph.statements || [],
     timeline_events: graph.timeline_events || [],
+    evidence_items: (graph.evidence_items || []).filter(item => item?.label),
+    evidence_tests: (graph.evidence_tests || []).filter(test => test?.evidence_label),
+    open_loops: (graph.open_loops || []).filter(loop => loop?.description),
   };
 }

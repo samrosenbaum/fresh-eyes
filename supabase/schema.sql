@@ -187,6 +187,64 @@ create table if not exists timeline_events (
   created_at timestamptz default now()
 );
 
+-- First-class evidence inventory: what was collected, where it stands, and
+-- exactly which document says so
+create table if not exists evidence_items (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid references cases on delete cascade not null,
+  label text not null,
+  normalized_label text not null,
+  category text default 'other',    -- 'weapon' | 'biological' | 'fingerprint' | 'document' | 'clothing' | 'digital' | 'vehicle' | 'other'
+  description text,
+  status text default 'unknown',    -- 'unknown' | 'missing' | 'collected' | 'submitted' | 'tested'
+  collected_date date,
+  collected_location text,
+  source_file_id uuid references case_files,
+  source_page_id uuid references document_pages,
+  source_quote text,
+  source_verification text default 'unverified',
+  confidence float default 1.0,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique(case_id, normalized_label)
+);
+
+-- Lab/test results tied to evidence items; an item with no tests is the
+-- "untested evidence" gap
+create table if not exists evidence_tests (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid references cases on delete cascade not null,
+  evidence_item_id uuid references evidence_items on delete cascade not null,
+  test_type text default 'other',   -- 'dna' | 'fingerprint' | 'ballistics' | 'toxicology' | 'trace' | 'other'
+  result_summary text,
+  tested_date date,
+  lab_name text,
+  source_file_id uuid references case_files,
+  source_page_id uuid references document_pages,
+  source_quote text,
+  source_verification text default 'unverified',
+  created_at timestamptz default now()
+);
+
+-- Open loops: promised or implied investigative actions extracted from the
+-- documents ("will re-interview", "submitted to lab", "records requested")
+-- with no located completion — the "unfollowed leads" gap
+create table if not exists open_loops (
+  id uuid primary key default gen_random_uuid(),
+  case_id uuid references cases on delete cascade not null,
+  description text not null,
+  loop_type text default 'other',   -- 'planned_interview' | 'lab_submission' | 'records_request' | 'follow_up' | 'canvass' | 'other'
+  raised_date date,
+  involved_entity_ids uuid[] default '{}',
+  status text default 'open',       -- 'open' | 'resolved' | 'not_a_lead'
+  resolution_notes text,
+  source_file_id uuid references case_files,
+  source_page_id uuid references document_pages,
+  source_quote text,
+  source_verification text default 'unverified',
+  created_at timestamptz default now()
+);
+
 -- Detected contradictions and anomalies
 create table if not exists contradictions (
   id uuid primary key default gen_random_uuid(),
@@ -228,6 +286,9 @@ alter table entity_mentions enable row level security;
 alter table relationships enable row level security;
 alter table statements enable row level security;
 alter table timeline_events enable row level security;
+alter table evidence_items enable row level security;
+alter table evidence_tests enable row level security;
+alter table open_loops enable row level security;
 alter table contradictions enable row level security;
 alter table case_reports enable row level security;
 
@@ -264,6 +325,15 @@ create policy "statements access" on statements
   for all using (case_id in (select id from cases where created_by = auth.uid()));
 
 create policy "timeline_events access" on timeline_events
+  for all using (case_id in (select id from cases where created_by = auth.uid()));
+
+create policy "evidence_items access" on evidence_items
+  for all using (case_id in (select id from cases where created_by = auth.uid()));
+
+create policy "evidence_tests access" on evidence_tests
+  for all using (case_id in (select id from cases where created_by = auth.uid()));
+
+create policy "open_loops access" on open_loops
   for all using (case_id in (select id from cases where created_by = auth.uid()));
 
 create policy "contradictions access" on contradictions
@@ -362,3 +432,26 @@ begin
   end if;
 end $$;
 create index if not exists entity_merge_proposals_case_idx on entity_merge_proposals (case_id, status);
+
+-- Evidence & gaps migrations
+-- (tables are defined above with `if not exists`; for an existing database,
+-- re-run the three create-table blocks for evidence_items, evidence_tests,
+-- and open_loops, or run this whole file's additive section)
+do $$
+begin
+  if not exists (select 1 from pg_policies where tablename = 'evidence_items' and policyname = 'evidence_items access') then
+    create policy "evidence_items access" on evidence_items
+      for all using (case_id in (select id from cases where created_by = auth.uid()));
+  end if;
+  if not exists (select 1 from pg_policies where tablename = 'evidence_tests' and policyname = 'evidence_tests access') then
+    create policy "evidence_tests access" on evidence_tests
+      for all using (case_id in (select id from cases where created_by = auth.uid()));
+  end if;
+  if not exists (select 1 from pg_policies where tablename = 'open_loops' and policyname = 'open_loops access') then
+    create policy "open_loops access" on open_loops
+      for all using (case_id in (select id from cases where created_by = auth.uid()));
+  end if;
+end $$;
+create index if not exists evidence_items_case_idx on evidence_items (case_id, status);
+create index if not exists evidence_tests_item_idx on evidence_tests (evidence_item_id);
+create index if not exists open_loops_case_idx on open_loops (case_id, status);

@@ -56,6 +56,39 @@ Extract all of the following from this document and return a single JSON object:
       "page": 3,
       "quote": "verbatim excerpt supporting this event"
     }
+  ],
+  "evidence_items": [
+    {
+      "label": "short identifying label (e.g. 'kitchen knife', 'Item #12 — blue sweater')",
+      "category": "weapon" | "biological" | "fingerprint" | "document" | "clothing" | "digital" | "vehicle" | "other",
+      "description": "what it is, condition, where found",
+      "status": "collected" | "submitted" | "tested" | "missing" | "unknown",
+      "collected_date": "YYYY-MM-DD or null",
+      "collected_location": "where it was found/collected, or null",
+      "page": 3,
+      "quote": "verbatim excerpt about this evidence"
+    }
+  ],
+  "evidence_tests": [
+    {
+      "evidence_label": "label of the evidence item this result belongs to",
+      "test_type": "dna" | "fingerprint" | "ballistics" | "toxicology" | "trace" | "other",
+      "result_summary": "what the test found, verbatim where possible",
+      "tested_date": "YYYY-MM-DD or null",
+      "lab_name": "lab or examiner name, or null",
+      "page": 3,
+      "quote": "verbatim excerpt reporting this result"
+    }
+  ],
+  "open_loops": [
+    {
+      "description": "the promised or implied investigative action (e.g. 'Det. Rowe to re-interview neighbor', 'swabs submitted to state lab')",
+      "loop_type": "planned_interview" | "lab_submission" | "records_request" | "follow_up" | "canvass" | "other",
+      "raised_date": "YYYY-MM-DD or null",
+      "people": ["names of people involved"],
+      "page": 3,
+      "quote": "verbatim excerpt where this action is promised or implied"
+    }
   ]
 }
 
@@ -65,6 +98,9 @@ Rules:
 - If a person's role is ambiguous, use "mentioned"
 - For statements, include both direct quotes and reported speech ("He said he was...")
 - For timeline events, include claimed events even if unverified (the contradiction detector will handle conflicts)
+- For evidence, extract EVERY physical/digital item collected, mentioned, or referenced — including items referenced but never located
+- Record a test result in "evidence_tests" only when the document actually reports one; an evidence item with no located result is an investigative gap the system tracks
+- "open_loops" are commitments or implied actions: planned interviews, submissions to labs, records requests, follow-ups ("will contact", "pending", "to be determined")
 - "page" must be the number from the [PAGE N] header the supporting text appears under
 - "quote" must be copied verbatim from the document (trim to under ~200 characters); never invent or paraphrase quotes
 - List every page an entity appears on in its "mentions" array
