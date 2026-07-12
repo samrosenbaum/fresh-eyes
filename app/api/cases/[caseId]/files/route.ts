@@ -1,40 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
-import { supabaseAdmin } from '@/lib/supabase';
+import { SupabaseClient } from '@supabase/supabase-js';
 import { sendEvent } from '@/lib/inngest';
+import { authenticateRequest, requireCaseAccess } from '@/lib/api-auth';
+import { createImportBatch, LOW_CONFIDENCE_THRESHOLD } from '@/lib/import-batches';
 
 export const maxDuration = 60;
 
-function getSupabaseUser(token: string) {
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-  );
-  return supabase.auth.getUser(token);
-}
-
-async function requireCaseAccess(caseId: string, userId: string) {
-  const { data, error } = await supabaseAdmin
-    .from('cases')
-    .select('id')
-    .eq('id', caseId)
-    .eq('created_by', userId)
-    .single();
-
-  if (error || !data) return false;
-  return true;
-}
-
-async function loadIntakeSummary(caseId: string) {
-  const [batchesRes, pagesRes] = await Promise.all([
-    supabaseAdmin
+async function loadIntakeSummary(db: SupabaseClient, caseId: string) {
+  const [batchesRes, pagesRes, documentsRes] = await Promise.all([
+    db
       .from('import_batches')
       .select('*')
       .eq('case_id', caseId)
       .order('created_at', { ascending: false }),
-    supabaseAdmin
+    db
       .from('document_pages')
       .select('id, ocr_confidence, duplicate_of_page_id, processing_status')
+      .eq('case_id', caseId),
+    db
+      .from('case_documents')
+      .select('id', { count: 'exact', head: true })
       .eq('case_id', caseId),
   ]);
 
@@ -44,22 +29,21 @@ async function loadIntakeSummary(caseId: string) {
   return {
     batches,
     pageCount: pages.length,
-    lowConfidencePages: pages.filter(page => typeof page.ocr_confidence === 'number' && page.ocr_confidence < 0.75).length,
+    documentsDetected: documentsRes.count || 0,
+    lowConfidencePages: pages.filter(page => typeof page.ocr_confidence === 'number' && page.ocr_confidence < LOW_CONFIDENCE_THRESHOLD).length,
     duplicatePages: pages.filter(page => page.duplicate_of_page_id).length,
     processingPages: pages.filter(page => page.processing_status === 'pending' || page.processing_status === 'processing').length,
   };
 }
 
 export async function GET(req: NextRequest, { params }: { params: { caseId: string } }) {
-  const token = req.headers.get('authorization')?.replace('Bearer ', '');
-  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  const { data: { user } } = await getSupabaseUser(token);
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  if (!(await requireCaseAccess(params.caseId, user.id))) {
+  const ctx = await authenticateRequest(req);
+  if (!ctx) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (!(await requireCaseAccess(ctx, params.caseId))) {
     return NextResponse.json({ error: 'Case not found' }, { status: 404 });
   }
 
-  const { data, error } = await supabaseAdmin
+  const { data, error } = await ctx.db
     .from('case_files')
     .select('*, import_batches(id, label, status, created_at)')
     .eq('case_id', params.caseId)
@@ -67,16 +51,14 @@ export async function GET(req: NextRequest, { params }: { params: { caseId: stri
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-  const intake = await loadIntakeSummary(params.caseId);
+  const intake = await loadIntakeSummary(ctx.db, params.caseId);
   return NextResponse.json({ files: data, intake });
 }
 
 export async function POST(req: NextRequest, { params }: { params: { caseId: string } }) {
-  const token = req.headers.get('authorization')?.replace('Bearer ', '');
-  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  const { data: { user } } = await getSupabaseUser(token);
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  if (!(await requireCaseAccess(params.caseId, user.id))) {
+  const ctx = await authenticateRequest(req);
+  if (!ctx) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (!(await requireCaseAccess(ctx, params.caseId))) {
     return NextResponse.json({ error: 'Case not found' }, { status: 404 });
   }
 
@@ -88,20 +70,25 @@ export async function POST(req: NextRequest, { params }: { params: { caseId: str
   }
 
   let batchId = importBatchId as string | undefined;
-  if (!batchId) {
-    const { data: batch, error: batchError } = await supabaseAdmin.from('import_batches').insert({
-      case_id: params.caseId,
-      uploaded_by: user.id,
-      label: `Upload ${new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })}`,
-      status: 'pending',
-      file_count: 0,
-    }).select('id').single();
-
-    if (batchError) return NextResponse.json({ error: batchError.message }, { status: 500 });
-    batchId = batch.id;
+  if (batchId) {
+    // The batch must belong to this case — reject cross-case attachment.
+    const { data: batch } = await ctx.db
+      .from('import_batches')
+      .select('id')
+      .eq('id', batchId)
+      .eq('case_id', params.caseId)
+      .single();
+    if (!batch) return NextResponse.json({ error: 'Import batch not found' }, { status: 404 });
+  } else {
+    try {
+      const batch = await createImportBatch(ctx.db, { caseId: params.caseId, userId: ctx.user.id });
+      batchId = batch.id;
+    } catch (err) {
+      return NextResponse.json({ error: err instanceof Error ? err.message : 'Failed to create batch' }, { status: 500 });
+    }
   }
 
-  const { data: file, error } = await supabaseAdmin.from('case_files').insert({
+  const { data: file, error } = await ctx.db.from('case_files').insert({
     case_id: params.caseId,
     import_batch_id: batchId,
     filename,
@@ -114,13 +101,13 @@ export async function POST(req: NextRequest, { params }: { params: { caseId: str
 
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-  await supabaseAdmin.from('import_batches').update({ status: 'processing' }).eq('id', batchId);
+  await ctx.db.from('import_batches').update({ status: 'processing' }).eq('id', batchId);
 
   // Trigger background processing
   await sendEvent('document/uploaded', {
     caseId: params.caseId,
     fileId: file.id,
-    importBatchId: batchId,
+    importBatchId: batchId!,
     storagePath,
     fileType: fileType || 'unknown',
     documentType: documentType || 'other',

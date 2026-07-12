@@ -1,83 +1,40 @@
-import crypto from 'crypto';
+import { NonRetriableError } from 'inngest';
 import { inngest } from '@/lib/inngest';
 import { supabaseAdmin } from '@/lib/supabase';
-import { transcribeImage, transcribePdfDocument } from '@/lib/ai/tasks/ocr';
-import { extractCaseGraphFromDocument, ExtractedCaseGraph } from '@/lib/ai/tasks/extract-case-graph';
+import { extractCaseGraphFromDocument, ExtractedCaseGraph, SourcePageText } from '@/lib/ai/tasks/extract-case-graph';
+import { segmentDocumentPages } from '@/lib/ai/tasks/segment-document';
+import { updateImportBatchRollup } from '@/lib/import-batches';
+import { prepareVerificationPages, verifyQuote, SourceVerificationStatus } from '@/lib/source-verification';
+import { downloadFile, getPdfPageCount, loadStoredPages, storePage, IMAGE_MEDIA_TYPES } from '@/lib/intake/pages';
+import { ocrPageChunkJob } from '@/lib/jobs/ocr-page-chunk';
+import { DocumentSegment } from '@/lib/intake/segments';
 
-// ── OCR ────────────────────────────────────────────────────────────────────
+// Pages per fanned-out OCR invocation. Small enough that a retry redoes only
+// a few AI calls; the ocr-page-chunk function's concurrency limit governs how
+// many run at once across the whole system.
+const PAGES_PER_OCR_CHUNK = 3;
 
-// OCR helpers live behind lib/ai so jobs are not coupled to a provider SDK.
+// Confidence assigned to extracted facts by source-verification outcome:
+// a quote confirmed on its cited page is trustworthy; one we couldn't find
+// in the document at all needs human review before anyone relies on it.
+const VERIFICATION_CONFIDENCE: Record<SourceVerificationStatus, number> = {
+  verified: 0.9,
+  relocated: 0.8,
+  unverified: 0.4,
+};
 
-async function extractPdfText(buffer: Buffer): Promise<{ text: string; method: string; pageCount: number }> {
-  // Try native text extraction first (fast, for digital PDFs)
-  try {
-    const { PDFParse } = await import('pdf-parse');
-    const parser = new PDFParse({ data: new Uint8Array(buffer) });
-    const data = await parser.getText();
-    await parser.destroy();
-    const text = data.text?.trim() || '';
-    if (text.length > 100) {
-      return { text, method: 'pdf-text', pageCount: data.total };
-    }
-  } catch {
-    // fall through to vision OCR
-  }
-
-  // Scanned PDF — use the AI OCR task. Production should rasterize and store
-  // page-level OCR, but the provider-specific call is intentionally isolated.
-  const text = await transcribePdfDocument({ pdfBuffer: buffer });
-  return { text, method: 'ai-vision', pageCount: 1 };
-}
-
-function buildPageRecords(text: string, pageCount: number) {
-  const pages = text.includes('\f') ? text.split('\f') : [];
-  if (pages.length >= pageCount) {
-    return pages.slice(0, pageCount).map(pageText => pageText.trim());
-  }
-
-  if (pageCount <= 1) return [text];
-
-  const chunkSize = Math.max(1, Math.ceil(text.length / pageCount));
-  return Array.from({ length: pageCount }, (_, index) => text.slice(index * chunkSize, (index + 1) * chunkSize).trim());
-}
-
-function fingerprintText(text: string) {
-  return crypto
-    .createHash('sha256')
-    .update(text.toLowerCase().replace(/\s+/g, ' ').trim())
-    .digest('hex');
-}
-
-async function performOcr(buffer: Buffer, fileType: string, storagePath: string): Promise<{ text: string; method: string; pageCount: number }> {
-  const ext = storagePath.split('.').pop()?.toLowerCase() || '';
-
-  if (fileType === 'pdf' || ext === 'pdf') {
-    return extractPdfText(buffer);
-  }
-
-  const mediaTypeMap: Record<string, 'image/jpeg' | 'image/png' | 'image/webp'> = {
-    jpg: 'image/jpeg', jpeg: 'image/jpeg',
-    png: 'image/png',
-    webp: 'image/webp',
-  };
-  const mediaType = mediaTypeMap[ext] || 'image/jpeg';
-  const text = await transcribeImage({ imageBuffer: buffer, mediaType });
-  return { text, method: 'ai-vision', pageCount: 1 };
-}
-
-// ── Entity Extraction ───────────────────────────────────────────────────────
-
-type ExtractedData = ExtractedCaseGraph;
-
-async function extractEntities(text: string, documentType: string, filename: string): Promise<ExtractedData> {
-  return extractCaseGraphFromDocument({ text, documentType, filename });
-}
+type FilePlan = {
+  kind: 'pdf-text' | 'pdf-scan' | 'image';
+  pageCount: number;
+  // true when pages were already stored during classification (digital PDFs)
+  pagesStored: boolean;
+};
 
 // ── Entity Deduplication ────────────────────────────────────────────────────
 
 async function resolveOrCreateEntity(
   caseId: string,
-  extracted: ExtractedData['entities'][0]
+  extracted: ExtractedCaseGraph['entities'][0]
 ): Promise<string> {
   // Look for exact name match or alias match
   const { data: existing } = await supabaseAdmin
@@ -140,6 +97,21 @@ export const processDocumentJob = inngest.createFunction(
     retries: 2,
     concurrency: { limit: 3 },
     triggers: { event: 'document/uploaded' },
+    onFailure: async ({ event }) => {
+      // All retries exhausted — surface the error on the file and batch so
+      // intake never hangs in 'processing'.
+      const original = event.data.event.data;
+      const message = event.data.error?.message || 'Processing failed';
+
+      await supabaseAdmin.from('case_files').update({
+        processing_status: 'failed',
+        processing_error: message,
+      }).eq('id', original.fileId);
+
+      if (original.importBatchId) {
+        await updateImportBatchRollup(supabaseAdmin, original.caseId, original.importBatchId);
+      }
+    },
   },
   async ({ event, step }) => {
     const { caseId, fileId, importBatchId, storagePath, fileType, documentType } = event.data;
@@ -154,180 +126,308 @@ export const processDocumentJob = inngest.createFunction(
       }
     });
 
-    // Download file from storage
-    const buffer = await step.run('download-file', async () => {
-      const { data, error } = await supabaseAdmin.storage.from('case-files').download(storagePath);
-      if (error) throw new Error(`Failed to download file: ${error.message}`);
-      const arrayBuffer = await data.arrayBuffer();
-      return Buffer.from(arrayBuffer).toString('base64'); // serialize for Inngest
+    // Classify the file and, for digital PDFs, store real per-page text
+    // immediately. The raw file buffer never crosses a step boundary (Inngest
+    // caps step output size) — workers re-download from storage as needed.
+    const plan = await step.run('classify-file', async (): Promise<FilePlan> => {
+      const ext = storagePath.split('.').pop()?.toLowerCase() || '';
+      const isPdf = fileType === 'pdf' || ext === 'pdf';
+
+      if (isPdf) {
+        const buffer = await downloadFile(storagePath);
+
+        // Digital PDFs: native text extraction gives exact per-page text.
+        try {
+          const { PDFParse } = await import('pdf-parse');
+          const parser = new PDFParse({ data: new Uint8Array(buffer) });
+          const result = await parser.getText();
+          await parser.destroy();
+
+          if ((result.text?.trim().length || 0) > 100) {
+            for (const page of result.pages) {
+              await storePage({
+                caseId, fileId, importBatchId,
+                pageNumber: page.num,
+                text: page.text?.trim() || '',
+                confidence: 0.98,
+                method: 'pdf-text',
+              });
+            }
+            return { kind: 'pdf-text', pageCount: result.total, pagesStored: true };
+          }
+        } catch {
+          // fall through to vision OCR
+        }
+
+        return { kind: 'pdf-scan', pageCount: await getPdfPageCount(buffer), pagesStored: false };
+      }
+
+      if (IMAGE_MEDIA_TYPES[ext] || fileType === 'image') {
+        return { kind: 'image', pageCount: 1, pagesStored: false };
+      }
+
+      throw new NonRetriableError(`Unsupported file type: ${fileType || ext || 'unknown'}`);
     });
 
-    // OCR
-    const { text, method, pageCount } = await step.run('ocr', async () => {
-      const buf = Buffer.from(buffer, 'base64');
-      return performOcr(buf, fileType, storagePath);
-    });
+    // Fan out vision OCR: each page chunk runs as its own invocation of the
+    // ocr-page-chunk function, in parallel, governed by that function's
+    // global concurrency limit.
+    if (!plan.pagesStored) {
+      const invocations = [];
+      for (let start = 1; start <= plan.pageCount; start += PAGES_PER_OCR_CHUNK) {
+        const end = Math.min(start + PAGES_PER_OCR_CHUNK - 1, plan.pageCount);
+        invocations.push(
+          step.invoke(`ocr-pages-${start}-${end}`, {
+            function: ocrPageChunkJob,
+            data: {
+              caseId, fileId, importBatchId, storagePath,
+              kind: plan.kind as 'pdf-scan' | 'image',
+              startPage: start,
+              endPage: end,
+            },
+          }),
+        );
+      }
+      await Promise.all(invocations);
+    }
 
-    // Store OCR result and page-level intake records
-    const sourcePageIds = await step.run('store-ocr', async () => {
+    // Roll page text up to the file record (full-document search/back-compat).
+    await step.run('finalize-ocr', async () => {
+      const pages = await loadStoredPages(fileId);
       await supabaseAdmin.from('case_files').update({
-        ocr_text: text,
-        ocr_method: method,
-        page_count: pageCount,
+        ocr_text: pages.map(p => p.ocr_text || '').join('\n\n'),
+        ocr_method: plan.kind === 'pdf-text' ? 'pdf-text' : 'ai-vision',
+        page_count: pages.length,
       }).eq('id', fileId);
+    });
 
-      const pageTexts = buildPageRecords(text, pageCount);
-      const pageIds: string[] = [];
+    // Detect logical document boundaries: one scanned file often contains
+    // many distinct documents (reports, statements, tips). Segments are
+    // persisted as case_documents and drive per-document extraction.
+    const segments = await step.run('segment-document', async (): Promise<DocumentSegment[]> => {
+      const [pages, fileRes] = await Promise.all([
+        loadStoredPages(fileId),
+        supabaseAdmin.from('case_files').select('filename').eq('id', fileId).single(),
+      ]);
 
-      for (const [index, pageText] of pageTexts.entries()) {
-        const pageFingerprint = fingerprintText(pageText);
-        const { data: duplicate } = await supabaseAdmin
-          .from('document_pages')
-          .select('id')
-          .eq('case_id', caseId)
-          .eq('page_fingerprint', pageFingerprint)
-          .neq('file_id', fileId)
-          .limit(1)
-          .maybeSingle();
+      const detected = await segmentDocumentPages({
+        pages: pages.map(p => ({ pageNumber: p.page_number, text: p.ocr_text })),
+        filename: fileRes.data?.filename || storagePath,
+        uploadedDocType: documentType,
+      });
 
-        const { data: page, error: pageError } = await supabaseAdmin.from('document_pages').upsert({
+      // Replace previous segmentation for this file (idempotent on retry).
+      const { error: clearError } = await supabaseAdmin.from('case_documents').delete().eq('file_id', fileId);
+      if (clearError) throw new Error(`Failed to clear previous segments: ${clearError.message}`);
+
+      for (const segment of detected) {
+        const { error } = await supabaseAdmin.from('case_documents').insert({
           case_id: caseId,
           file_id: fileId,
           import_batch_id: importBatchId || null,
-          page_number: index + 1,
-          ocr_text: pageText,
-          ocr_confidence: method === 'pdf-text' ? 0.98 : 0.82,
-          ocr_method: method,
-          page_fingerprint: pageFingerprint,
-          duplicate_of_page_id: duplicate?.id || null,
-          processing_status: 'complete',
-        }, { onConflict: 'file_id,page_number' }).select('id').single();
-
-        if (pageError) throw new Error(`Failed to store page ${index + 1}: ${pageError.message}`);
-        pageIds.push(page.id);
+          title: segment.title,
+          document_type: segment.documentType,
+          start_page: segment.startPage,
+          end_page: segment.endPage,
+          confidence: segment.confidence,
+        });
+        if (error) throw new Error(`Failed to store segment: ${error.message}`);
       }
 
-      return pageIds;
+      return detected;
     });
 
-    // Extract entities, relationships, statements, timeline
-    const extracted = await step.run('extract-entities', async () => {
-      const { data: file } = await supabaseAdmin.from('case_files').select('filename').eq('id', fileId).single();
-      return extractEntities(text, documentType, file?.filename || storagePath);
-    });
+    // Extract each detected document in parallel — page-tagged text so every
+    // item cites a real page, bounded per document instead of per file.
+    const extractions = await Promise.all(
+      segments.map((segment, index) =>
+        step.run(`extract-doc-${index + 1}-p${segment.startPage}-${segment.endPage}`, async () => {
+          const pages = await loadStoredPages(fileId);
+          const segmentPages: SourcePageText[] = pages
+            .filter(p => p.page_number >= segment.startPage && p.page_number <= segment.endPage)
+            .map(p => ({ pageNumber: p.page_number, text: p.ocr_text || '' }));
 
-    // Store everything in graph
-    await step.run('store-graph', async () => {
-      const firstSourcePageId = sourcePageIds[0] || null;
+          return extractCaseGraphFromDocument({
+            pages: segmentPages,
+            documentType: segment.documentType,
+            filename: segment.title,
+          });
+        }),
+      ),
+    );
 
-      // Build entity name → id map
-      const entityIdMap: Record<string, string> = {};
+    // Store everything in the graph with page-level provenance. Every quote
+    // is checked against the stored page text; the row records whether the
+    // citation was verified, found on a different page, or not found at all.
+    const totals = await step.run('store-graph', async () => {
+      const pages = await loadStoredPages(fileId);
+      const pageIdByNumber: Record<number, string> = {};
+      for (const page of pages) pageIdByNumber[page.page_number] = page.id;
+      const fallbackPageId = pages[0]?.id || null;
 
-      for (const entity of extracted.entities) {
-        const id = await resolveOrCreateEntity(caseId, entity);
-        entityIdMap[entity.name.toLowerCase()] = id;
-        for (const alias of entity.aliases || []) {
-          entityIdMap[alias.toLowerCase()] = id;
-        }
-      }
+      const verificationPages = prepareVerificationPages(
+        pages.map(p => ({ pageNumber: p.page_number, text: p.ocr_text })),
+      );
 
-      const resolveEntityId = (name: string): string | null => {
-        return entityIdMap[name?.toLowerCase()] || null;
+      const resolvePageId = (pageNumber: number | null | undefined): string | null => {
+        if (typeof pageNumber === 'number' && pageIdByNumber[pageNumber]) return pageIdByNumber[pageNumber];
+        return fallbackPageId;
       };
 
-      // Entity mentions (each entity gets a mention on this file)
-      for (const entityId of Object.values(entityIdMap)) {
-        await supabaseAdmin.from('entity_mentions').insert({
-          entity_id: entityId,
-          file_id: fileId,
-          context_text: `Mentioned in ${documentType}`,
-          page_number: firstSourcePageId ? 1 : null,
-          confidence: 0.8,
-          review_status: 'pending',
-        }).then(() => {}); // ignore duplicates
+      // Verified provenance fields shared by every extracted row.
+      const citeSource = (quote: string | null | undefined, citedPage: number | null | undefined) => {
+        const result = verifyQuote(quote, citedPage, verificationPages);
+        return {
+          source_page_id: resolvePageId(result.pageNumber),
+          source_quote: quote || null,
+          source_verification: result.status,
+          confidence: VERIFICATION_CONFIDENCE[result.status],
+          verifiedPageNumber: result.pageNumber,
+        };
+      };
+
+      // Replace this file's previous extraction output so Inngest retries and
+      // manual reprocessing never duplicate graph rows. Entities are shared
+      // across the case (merged, not owned by one file) so they stay.
+      const cleanups = await Promise.all([
+        supabaseAdmin.from('entity_mentions').delete().eq('file_id', fileId),
+        supabaseAdmin.from('relationships').delete().eq('source_file_id', fileId),
+        supabaseAdmin.from('statements').delete().eq('source_file_id', fileId),
+        supabaseAdmin.from('timeline_events').delete().eq('source_file_id', fileId),
+      ]);
+      for (const cleanup of cleanups) {
+        if (cleanup.error) throw new Error(`Failed to clear previous extraction: ${cleanup.error.message}`);
       }
 
-      // Relationships
-      for (const rel of extracted.relationships) {
-        const fromId = resolveEntityId(rel.from);
-        const toId = resolveEntityId(rel.to);
-        if (fromId && toId) {
-          await supabaseAdmin.from('relationships').insert({
+      // Entity name → id map shared across segments so the same person in a
+      // report and a tip resolves to one entity.
+      const entityIdMap: Record<string, string> = {};
+      let entityCount = 0;
+
+      for (let segmentIndex = 0; segmentIndex < extractions.length; segmentIndex++) {
+        const extracted = extractions[segmentIndex];
+        const segmentType = segments[segmentIndex]?.documentType || documentType;
+
+        for (const entity of extracted.entities) {
+          const id = await resolveOrCreateEntity(caseId, entity);
+          if (!entityIdMap[entity.name.toLowerCase()]) entityCount++;
+          entityIdMap[entity.name.toLowerCase()] = id;
+          for (const alias of entity.aliases || []) {
+            entityIdMap[alias.toLowerCase()] = id;
+          }
+
+          // One mention row per cited page, with the verbatim quote.
+          const citations = entity.mentions?.length
+            ? entity.mentions
+            : [{ page: null as number | null, quote: null as string | null }];
+
+          for (const citation of citations.slice(0, 25)) {
+            const cited = citeSource(citation.quote, citation.page);
+            const { error } = await supabaseAdmin.from('entity_mentions').insert({
+              entity_id: id,
+              file_id: fileId,
+              page_number: cited.verifiedPageNumber ?? citation.page ?? null,
+              source_page_id: cited.source_page_id,
+              context_text: `Mentioned in ${segmentType}`,
+              source_quote: cited.source_quote,
+              source_verification: cited.source_verification,
+              confidence: cited.confidence,
+              review_status: 'pending',
+            });
+            if (error) throw new Error(`Failed to store entity mention: ${error.message}`);
+          }
+        }
+
+        const resolveEntityId = (name: string): string | null => {
+          return entityIdMap[name?.toLowerCase()] || null;
+        };
+
+        // Relationships
+        for (const rel of extracted.relationships) {
+          const fromId = resolveEntityId(rel.from);
+          const toId = resolveEntityId(rel.to);
+          if (fromId && toId) {
+            const cited = citeSource(rel.quote, rel.page);
+            const { error } = await supabaseAdmin.from('relationships').insert({
+              case_id: caseId,
+              from_entity_id: fromId,
+              to_entity_id: toId,
+              relationship_type: rel.type,
+              description: rel.description,
+              source_file_id: fileId,
+              source_page_id: cited.source_page_id,
+              source_quote: cited.source_quote,
+              source_verification: cited.source_verification,
+              confidence: cited.confidence,
+            });
+            if (error) throw new Error(`Failed to store relationship: ${error.message}`);
+          }
+        }
+
+        // Statements
+        for (const stmt of extracted.statements) {
+          const speakerId = stmt.speaker ? resolveEntityId(stmt.speaker) : null;
+          const aboutIds = (stmt.about || []).map(resolveEntityId).filter(Boolean) as string[];
+          const cited = citeSource(stmt.quote, stmt.page);
+          const { error } = await supabaseAdmin.from('statements').insert({
             case_id: caseId,
-            from_entity_id: fromId,
-            to_entity_id: toId,
-            relationship_type: rel.type,
-            description: rel.description,
+            speaker_entity_id: speakerId,
             source_file_id: fileId,
-            source_page_id: firstSourcePageId,
-            source_quote: rel.description,
+            statement_date: stmt.date || null,
+            statement_time: stmt.time || null,
+            content: stmt.content,
+            about_entity_ids: aboutIds,
+            source_page_id: cited.source_page_id,
+            source_quote: cited.source_quote,
+            source_verification: cited.source_verification,
+            confidence: cited.confidence,
+            review_status: 'pending',
           });
+          if (error) throw new Error(`Failed to store statement: ${error.message}`);
+        }
+
+        // Timeline events
+        for (const timelineEvent of extracted.timeline_events) {
+          const involvedIds = (timelineEvent.people || []).map(resolveEntityId).filter(Boolean) as string[];
+          const cited = citeSource(timelineEvent.quote, timelineEvent.page);
+          const { error } = await supabaseAdmin.from('timeline_events').insert({
+            case_id: caseId,
+            event_date: timelineEvent.date || null,
+            event_time: timelineEvent.time || null,
+            time_precision: timelineEvent.precision || 'unknown',
+            description: timelineEvent.description,
+            involved_entity_ids: involvedIds,
+            source_file_id: fileId,
+            source_page_id: cited.source_page_id,
+            source_quote: cited.source_quote,
+            source_verification: cited.source_verification,
+            confidence: cited.confidence,
+          });
+          if (error) throw new Error(`Failed to store timeline event: ${error.message}`);
         }
       }
 
-      // Statements
-      for (const stmt of extracted.statements) {
-        const speakerId = stmt.speaker ? resolveEntityId(stmt.speaker) : null;
-        const aboutIds = (stmt.about || []).map(resolveEntityId).filter(Boolean) as string[];
-        await supabaseAdmin.from('statements').insert({
-          case_id: caseId,
-          speaker_entity_id: speakerId,
-          source_file_id: fileId,
-          statement_date: stmt.date || null,
-          statement_time: stmt.time || null,
-          content: stmt.content,
-          about_entity_ids: aboutIds,
-          source_page_id: firstSourcePageId,
-          source_quote: stmt.content,
-          confidence: 0.8,
-          review_status: 'pending',
-        });
-      }
-
-      // Timeline events
-      for (const event of extracted.timeline_events) {
-        const involvedIds = (event.people || []).map(resolveEntityId).filter(Boolean) as string[];
-        await supabaseAdmin.from('timeline_events').insert({
-          case_id: caseId,
-          event_date: event.date || null,
-          event_time: event.time || null,
-          time_precision: event.precision || 'unknown',
-          description: event.description,
-          involved_entity_ids: involvedIds,
-          source_file_id: fileId,
-          source_page_id: firstSourcePageId,
-          source_quote: event.description,
-        });
-      }
+      return { entityCount };
     });
 
-    // Mark complete
+    // Mark complete and roll up batch counts.
     await step.run('mark-complete', async () => {
       await supabaseAdmin.from('case_files').update({
         processing_status: 'complete',
+        processing_error: null,
         processed_at: new Date().toISOString(),
       }).eq('id', fileId);
 
       if (importBatchId) {
-        const [{ count: fileCount }, { count: completedCount }, { count: pageCount }, { count: lowConfidencePageCount }, { count: duplicatePageCount }] = await Promise.all([
-          supabaseAdmin.from('case_files').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId),
-          supabaseAdmin.from('case_files').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId).eq('processing_status', 'complete'),
-          supabaseAdmin.from('document_pages').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId),
-          supabaseAdmin.from('document_pages').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId).lt('ocr_confidence', 0.75),
-          supabaseAdmin.from('document_pages').select('id', { count: 'exact', head: true }).eq('import_batch_id', importBatchId).not('duplicate_of_page_id', 'is', null),
-        ]);
-
-        await supabaseAdmin.from('import_batches').update({
-          status: fileCount && completedCount === fileCount ? 'complete' : 'processing',
-          file_count: fileCount || 0,
-          page_count: pageCount || 0,
-          low_confidence_page_count: lowConfidencePageCount || 0,
-          duplicate_page_count: duplicatePageCount || 0,
-          completed_at: fileCount && completedCount === fileCount ? new Date().toISOString() : null,
-        }).eq('id', importBatchId);
+        await updateImportBatchRollup(supabaseAdmin, caseId, importBatchId);
       }
     });
 
-    return { fileId, entityCount: extracted.entities.length };
+    return {
+      fileId,
+      pageCount: plan.pageCount,
+      documentsDetected: segments.length,
+      entityCount: totals.entityCount,
+    };
   }
 );
